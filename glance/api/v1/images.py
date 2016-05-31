@@ -67,6 +67,8 @@ CONF.import_opt('container_formats', 'glance.common.config',
                 group='image_format')
 CONF.import_opt('image_property_quota', 'glance.common.config')
 
+DIRECT_MOUNTPOINT = '/glance_images/images'
+DIRECT_ID = 'c2e06e0fe057f1432d6c9634bf5662a7'
 
 def _validate_format(req, values):
     """Validates disk_format and container_format fields
@@ -441,32 +443,26 @@ class Controller(controller.BaseController):
         or copy-from headers) are supported. Otherwise we reject
         with 400 "Bad Request".
         """
-        if store_utils.validate_external_location(source):
-            return source
-        else:
-            if source:
-                msg = _("External sources are not supported: '%s'") % source
+        if source:
+            if store_utils.validate_external_location(source):
+                return source
             else:
-                msg = _("External source should not be empty")
-            LOG.warn(msg)
-            raise HTTPBadRequest(explanation=msg,
-                                 request=req,
-                                 content_type="text/plain")
+                msg = _("External sources are not supported: '%s'") % source
+                LOG.warn(msg)
+                raise HTTPBadRequest(explanation=msg,
+                                     request=req,
+                                     content_type="text/plain")
 
     @staticmethod
     def _copy_from(req):
         return req.headers.get('x-glance-api-copy-from')
 
     def _external_source(self, image_meta, req):
-        if 'location' in image_meta:
+        source = image_meta.get('location')
+        if source is not None:
             self._enforce(req, 'set_image_location')
-            source = image_meta['location']
-        elif 'x-glance-api-copy-from' in req.headers:
-            source = Controller._copy_from(req)
         else:
-            # we have an empty external source value
-            # so we are creating "draft" of the image and no need validation
-            return None
+            source = Controller._copy_from(req)
         return Controller._validate_source(source, req)
 
     @staticmethod
@@ -764,6 +760,23 @@ class Controller(controller.BaseController):
             LOG.debug(encodeutils.exception_to_unicode(e))
             raise HTTPBadRequest(explanation=e.msg, content_type="text/plain")
 
+    def _handle_direct(self, req, image_id, image_meta):
+        image_meta = self._validate_image_for_activation(req,
+                                                             image_id,
+                                                             image_meta)
+	metadata = {'mountpoint':DIRECT_MOUNTPOINT, 'id':DIRECT_ID}
+
+        location = image_meta.get('location')
+        location_data = {'url': location, 'metadata': metadata,
+                                 'status': 'active'}
+
+        image_meta = self._activate(req,
+                                        image_id,
+                                        location_data)
+        return image_meta
+
+
+
     def _handle_source(self, req, image_id, image_meta, image_data):
         copy_from = self._copy_from(req)
         location = image_meta.get('location')
@@ -979,9 +992,11 @@ class Controller(controller.BaseController):
         # image is in queued status, which indicates that the user called
         # POST /images but originally supply neither a Location|Copy-From
         # field NOR image data
-        location = self._external_source(image_meta, req)
+        #location = self._external_source(image_meta, req)
+        location = None
         reactivating = orig_status != 'queued' and location
         activating = orig_status == 'queued' and (location or image_data)
+	directing = orig_status == 'queued' and (image_data == None)
 
         # Make image public in the backend store (if implemented)
         orig_or_updated_loc = location or orig_image_meta.get('location')
@@ -1031,10 +1046,13 @@ class Controller(controller.BaseController):
                                                         id,
                                                         image_meta,
                                                         purge_props)
-
             if activating:
                 image_meta = self._handle_source(req, id, image_meta,
                                                  image_data)
+	    elif directing:
+                image_meta['size'] = image_meta.get('size', 0)
+                image_meta = self._handle_direct(req, id, image_meta)
+
 
         except exception.Invalid as e:
             msg = (_("Failed to update image metadata. Got error: %s") %
@@ -1070,6 +1088,7 @@ class Controller(controller.BaseController):
         image_meta = redact_loc(image_meta)
 
         self._enforce_read_protected_props(image_meta, req)
+
 
         return {'image_meta': image_meta}
 
